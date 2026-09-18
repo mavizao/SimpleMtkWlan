@@ -689,6 +689,8 @@ void		mt7921_mac_write_txwi(struct mwx_softc *, struct mbuf *,
 		    struct ieee80211_node *, struct mt76_txwi *);
 void		mwx_mac_tx_free(struct mwx_softc *, struct mbuf *);
 int		mt7921_set_channel(struct mwx_softc *);
+int mt7921_mcu_set_associated_bss(struct mwx_softc *, int);
+int mt7921_mcu_set_associated_peer(struct mwx_softc *);
 
 uint8_t		 mt7921_get_phy_mode_v2(struct mwx_softc *,
 		    struct ieee80211_node *);
@@ -1291,6 +1293,11 @@ mwx_newstate_task(void *ptr)
 
 		mt7921_mcu_hw_scan_cancel(sc);
 		mwx_mcu_set_deep_sleep(sc, 0);
+		rv = mt7921_mcu_set_associated_bss(sc, 1);
+		if (!rv)
+			rv = mt7921_mcu_set_associated_peer(sc);
+		if (rv)
+			break;
 		mt7921_mcu_set_rts_thresh(sc, 0x92b, 0);
 		break;
 	}
@@ -6661,3 +6668,108 @@ MtkMwx::free()
 		releaseAll();
 		MtkHalService::free();
 	}
+
+static int mwx_send_assoc_status(struct mwx_softc *sc, uint32_t cmd, void *data, size_t len)
+{
+    int seq, rv;
+    uint32_t status = 0;
+    rv = mwx_mcu_send_msg(sc, cmd, data, len, &seq);
+    if (rv) return rv;
+    rv = mwx_mcu_wait_resp_int(sc, cmd, seq, &status);
+    MWX_DEV_LOG(sc, "assoc_status cmd=%x transport=%d firmware=%u\n", cmd, rv, status);
+    return rv ? rv : (status ? EIO : 0);
+}
+
+/* Publish the associated peer without resetting WTBL or key state. */
+int mt7921_mcu_set_associated_peer(struct mwx_softc *sc)
+{
+    struct ieee80211_node *ni = sc->sc_ic.ic_bss;
+    if (!ni || IEEE80211_AID(ni->ni_associd) == 0) return EINVAL;
+    struct mbuf *m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+    if (!m) return ENOBUFS;
+    uint16_t tlvnum = 0;
+    mt7921_mcu_add_basic_tlv(m, &tlvnum, sc, ni, 1, 0);
+    struct sta_rec_state *state = (struct sta_rec_state *)mwx_append_tlv(m, &tlvnum, STA_REC_STATE, sizeof(*state));
+    state->state = 2; /* MT76_STA_INFO_STATE_ASSOC: NONE=0, AUTH=1, ASSOC=2. */
+    m = mwx_fill_sta_req_hdr(m, &sc->sc_vif, sc->sc_vif.omac_idx, ((struct mwx_node *)ni)->wcid, tlvnum);
+    if (!m) return ENOBUFS;
+    int seq, rv = mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, &seq);
+    uint32_t status = 0;
+    if (!rv) rv = mwx_mcu_wait_resp_int(sc, MCU_UNI_CMD_STA_REC_UPDATE, seq, &status);
+    MWX_DEV_LOG(sc, "assoc_peer aid=%u state=2 transport=%d firmware=%u\n", IEEE80211_AID(ni->ni_associd), rv, status);
+    return rv ? rv : (status ? EIO : 0);
+}
+
+int
+mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni = ic->ic_bss;
+	struct mwx_vif *mvif = &sc->sc_vif;
+	struct {
+		uint8_t bss_idx;
+		uint8_t pad[3];
+		struct mt76_connac_bss_basic_tlv basic;
+	} __packed bss = {};
+	struct {
+		uint8_t bss_idx;
+		uint8_t pad[3];
+		struct {
+			uint16_t tag, len;
+			uint8_t control_channel, center_chan, center_chan2, bw;
+			uint8_t tx_streams, rx_streams, short_st, ht_op_info;
+			uint8_t sco, band, pad[2];
+		} __packed rlm;
+	} __packed channel = {};
+	int rv, is_2g;
+
+	if (ic->ic_opmode != IEEE80211_M_STA)
+		return 0;
+	if (ni == NULL || ni->ni_chan == NULL ||
+	    ni->ni_chan == IEEE80211_CHAN_ANYC)
+		return EINVAL;
+	if (mt7921_mcu_chan_bw(ni->ni_chan) != CMD_CBW_20MHZ)
+		return EOPNOTSUPP;
+	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
+	bss.bss_idx = mvif->idx;
+	bss.basic.tag = htole16(UNI_BSS_INFO_BASIC);
+	bss.basic.len = htole16(sizeof(bss.basic));
+	bss.basic.active = 1;
+	bss.basic.omac_idx = mvif->omac_idx;
+	bss.basic.hw_bss_idx = mvif->omac_idx > EXT_BSSID_START ?
+	    HW_BSSID_0 : mvif->omac_idx;
+	bss.basic.band_idx = mvif->band_idx;
+	bss.basic.conn_type = htole32(STA_TYPE_STA | NETWORK_INFRA);
+	bss.basic.conn_state = associated ? 0 : 1;
+	bss.basic.wmm_idx = mvif->wmm_idx;
+	memcpy(bss.basic.bssid, ni->ni_bssid, ETHER_ADDR_LEN);
+	bss.basic.bmc_tx_wlan_idx = htole16(mvif->vif_mn.wcid);
+	bss.basic.sta_idx = htole16(mvif->vif_mn.wcid);
+	bss.basic.bcn_interval = htole16(ni->ni_intval);
+	bss.basic.dtim_period = ni->ni_dtimperiod;
+	/* BSS phymode uses A/B/G bits; nonht_basic_phy uses PHY_TYPE bits. */
+	bss.basic.phymode = is_2g ? ((1U << 1) | (1U << 2)) : (1U << 0);
+	bss.basic.nonht_basic_phy = htole16(is_2g ?
+	    PHY_TYPE_BIT_HR_DSSS | PHY_TYPE_BIT_ERP : PHY_TYPE_BIT_OFDM);
+	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE, &bss, sizeof(bss));
+	MWX_DEV_LOG(sc, "associated BSS enable=%d channel=%u beacon=%u dtim=%u rv=%d\n",
+	    associated, ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0), ni->ni_intval, ni->ni_dtimperiod, rv);
+	if (rv != 0 || !associated)
+		return rv;
+
+	channel.bss_idx = mvif->idx;
+	channel.rlm.tag = htole16(UNI_BSS_INFO_RLM);
+	channel.rlm.len = htole16(sizeof(channel.rlm));
+	channel.rlm.control_channel = ieee80211_mhz2ieee(ni->ni_chan->ic_freq, 0);
+	channel.rlm.center_chan = channel.rlm.control_channel;
+	channel.rlm.bw = CMD_CBW_20MHZ;
+	channel.rlm.tx_streams = sc->sc_capa.num_streams;
+	channel.rlm.rx_streams = sc->sc_capa.antenna_mask;
+	channel.rlm.short_st = 1;
+	channel.rlm.band = is_2g ? 0 : 1;
+	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
+	    &channel, sizeof(channel));
+	MWX_DEV_LOG(sc, "associated BSS RLM channel=%u band=%u rv=%d\n",
+	    channel.rlm.control_channel, channel.rlm.band, rv);
+	return rv;
+}
