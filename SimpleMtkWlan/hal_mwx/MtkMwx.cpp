@@ -150,7 +150,11 @@ config_mountroot(struct device *self, void (*fn)(struct device *))
 	fn(self);
 }
 
-static inline void delay(int usec) { IOSleep((usec + 999) / 1000); }
+static inline void delay(int usec) {
+    if (usec <= 0) return;
+    if (usec < 1000) IODelay(usec);
+    else IOSleep((usec + 999) / 1000);
+}
 
 static inline struct mbuf *
 m_pullup(struct mbuf *m, size_t len)
