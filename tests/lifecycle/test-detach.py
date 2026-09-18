@@ -54,6 +54,6 @@ int main(){
  puts("PASS actual HAL detach body: 16 partial/full resource combinations, repeated detach, IRQ/queue/timer-before-buffer ordering. Mocks do not prove kernel scheduling.");
 }
 '''
-f=b/'test-detach.cpp';f.write_text(pre+'void MtkMwx::detach(IOPCIDevice *device)\n{'+body+'\n}\n'+post)
+f=out/'test-detach.cpp';f.write_text(pre+'void MtkMwx::detach(IOPCIDevice *device)\n{'+body+'\n}\n'+post)
 subprocess.run(['clang++','-std=c++14','-fsanitize=address,undefined','-g',str(f),'-o',str(out/'test-detach')],check=True)
 r=subprocess.run([str(out/'test-detach')],capture_output=True,text=True);(out/'test-detach-result.txt').write_text(r.stdout+r.stderr);print(r.stdout+r.stderr);r.check_returncode()
