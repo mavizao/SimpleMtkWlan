@@ -465,11 +465,20 @@ IOReturn SimpleMtkWlan::selectMedium(const IONetworkMedium *medium) {
 void SimpleMtkWlan::stop(IOService *provider)
 {
     XYLog("%s\n", __FUNCTION__);
+    if (fWatchdogWorkLoop && watchdogTimer) {
+        watchdogTimer->cancelTimeout();
+        watchdogTimer->disable();
+        fWatchdogWorkLoop->removeEventSource(watchdogTimer);
+        watchdogTimer->release();
+        watchdogTimer = NULL;
+        fWatchdogWorkLoop->release();
+        fWatchdogWorkLoop = NULL;
+    }
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     super::stop(provider);
     setLinkStatus(kIONetworkLinkValid);
-    fHalService->detach(pciNub);
     ether_ifdetach(ifp);
+    fHalService->detach(pciNub);
     detachInterface(fNetIf, true);
     OSSafeReleaseNULL(fNetIf);
     releaseAll();

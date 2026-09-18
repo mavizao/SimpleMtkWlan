@@ -400,6 +400,7 @@ struct mwx_softc {
 #define MWX_FLAG_BGSCAN			0x02
 	int			sc_coredump_cnt;
 	int8_t			sc_resetting;
+	bool sc_detaching, sc_net_attached;
 	int8_t			sc_fw_loaded;
 
 	enum ieee80211_state	sc_ns_state;
@@ -949,9 +950,9 @@ mwx_stop(struct ifnet *ifp)
 		task_del(sc->sc_nswq, &sc->sc_newstate_task);
 		task_del(sc->sc_nswq, &sc->sc_bgscan_done_task);
 		task_del(sc->sc_nswq, &sc->sc_setkey_task);
-		task_del(sc->sc_nswq, &sc->sc_scan_task);
 		task_del(sc->sc_nswq, &sc->sc_reset_task);
 	}
+	task_del(systq, &sc->sc_scan_task);
 	timeout_del(&sc->sc_reset_to);
 
 	ifp->if_timer = 0;
@@ -1809,7 +1810,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	    pci_intr_map_msi(pa, &ih) &&
 	    pci_intr_map(pa, &ih)) {
 		printf("%s: can't map interrupt\n", DEVNAME(sc));
-		bus_space_unmap(sc->sc_st, sc->sc_memh, sc->sc_mems);
+		/* HAL detach owns the mapping on failure. */
 		return false;
 	}
 	MWX_DEV_LOG(sc, "attach interrupt mapped source=%s\n",
@@ -1840,6 +1841,10 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 
 	sc->sc_ih = pci_intr_establish(pa->pa_pc, ih, IPL_NET,
 	    mwx_intr, sc, DEVNAME(sc));
+	if (sc->sc_ih == NULL) {
+		printf("%s: can't establish interrupt\n", DEVNAME(sc));
+		goto fail;
+	}
 	MWX_DEV_LOG(sc, "attach interrupt established handle=%p\n",
 	    (void *)sc->sc_ih);
 
@@ -1920,6 +1925,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 
 	if_attach(ifp);
 	ieee80211_ifattach(ifp, gMwxHal->mwxController());
+	sc->sc_net_attached = true;
 	ieee80211_media_init(ifp);
 	MWX_DEV_LOG(sc, "attach net80211 attached caps=0x%x max_aid=%u\n",
 	    ic->ic_caps, ic->ic_max_aid);
@@ -1965,17 +1971,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	return true;
 
 fail:
-	MWX_DEV_LOG(sc, "attach failed; cleaning resources\n");
-	if (sc->sc_nswq != NULL) {
-		taskq_destroy(sc->sc_nswq);
-		sc->sc_nswq = NULL;
-	}
-	timeout_free(&sc->sc_reset_to);
-	mwx_txwi_free(sc);
-	mwx_dma_free(sc);
-	if (sc->sc_ih != NULL)
-		pci_intr_disestablish(pa->pa_pc, sc->sc_ih);
-	bus_space_unmap(sc->sc_st, sc->sc_memh, sc->sc_mems);
+	/* The HAL caller owns partial-attach cleanup through detach(). */
 	return false;
 }
 
@@ -2001,7 +1997,7 @@ struct cfattach mwx_ca = {
 void
 mwx_reset(struct mwx_softc *sc)
 {
-	if (sc->sc_resetting)
+	if (sc->sc_resetting || sc->sc_detaching)
 		return;
 	sc->sc_resetting = 1;
 	task_add(sc->sc_nswq, &sc->sc_reset_task);
@@ -6448,8 +6444,12 @@ MtkMwx::attach(IOPCIDevice *device)
 	MWX_LOG("HAL attach allocated com=%p pci=%p\n",
 	    (void *)com, (void *)pci);
 
+	if (!taskq_init()) {
+		releaseAll();
+		return false;
+	}
+	taskQueueOwned = true;
 	gMwxHal = this;
-	taskq_init();
 	pci->pa_tag = device;
 	pci->workloop = getMainWorkLoop();
 	pci->pa_id = ((pcireg_t)device->configRead16(kIOPCIConfigDeviceID) << 16) |
@@ -6469,30 +6469,44 @@ MtkMwx::attach(IOPCIDevice *device)
 void
 MtkMwx::detach(IOPCIDevice *device)
 {
-	MWX_LOG("HAL detach begin device=%p com=%p\n",
-	    (void *)device, (void *)com);
-	if (com == NULL) {
-		releaseAll();
-		return;
-	}
-
-	struct ifnet *ifp = &com->sc_ic.ic_if;
-	if (ifp->if_flags & IFF_RUNNING)
-		mwx_stop(ifp);
-
-	task_del(systq, &com->sc_reset_task);
-	task_del(systq, &com->sc_scan_task);
-	ieee80211_ifdetach(ifp);
-	mwx_txwi_free(com);
-	mwx_dma_free(com);
-	if (com->sc_ih) {
-		pci_intr_disestablish(pci->pa_pc, com->sc_ih);
-		com->sc_ih = NULL;
-	}
-	if (com->sc_memh)
-		bus_space_unmap(com->sc_st, com->sc_memh, com->sc_mems);
-	releaseAll();
-	MWX_LOG("HAL detach complete\n");
+    MWX_LOG("HAL detach begin device=%p com=%p\n", (void *)device, (void *)com);
+    if (com == NULL) {
+        if (taskQueueOwned) { taskq_destroy(systq); taskQueueOwned = false; }
+        releaseAll();
+        return;
+    }
+    struct ifnet *ifp = &com->sc_ic.ic_if;
+    com->sc_detaching = true;
+    timeout_del(&com->sc_reset_to);
+    /* Keep interrupts alive while in-flight MCU requests finish. */
+    taskq_quiesce(com->sc_nswq);
+    if (taskQueueOwned) taskq_quiesce(systq);
+    if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
+    timeout_free(&com->sc_reset_to);
+    /* No interrupt callback may access buffers during their destruction. */
+    if (com->sc_ih) {
+        pci_intr_disestablish(pci->pa_pc, com->sc_ih);
+        com->sc_ih = NULL;
+    }
+    if (com->sc_memh) {
+        mwx_write(com, MT_WFDMA0_HOST_INT_ENA, 0);
+        mwx_dma_disable(com, 1);
+    }
+    if (com->sc_net_attached) {
+        ieee80211_ifdetach(ifp);
+        com->sc_net_attached = false;
+    }
+    taskq_destroy(com->sc_nswq);
+    com->sc_nswq = NULL;
+    if (taskQueueOwned) { taskq_destroy(systq); taskQueueOwned = false; }
+    mwx_txwi_free(com);
+    mwx_dma_free(com);
+    if (com->sc_memh) {
+        bus_space_unmap(com->sc_st, com->sc_memh, com->sc_mems);
+        com->sc_memh = 0;
+    }
+    releaseAll();
+    MWX_LOG("HAL detach complete\n");
 }
 
 IOReturn
