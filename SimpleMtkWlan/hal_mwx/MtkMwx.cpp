@@ -4286,6 +4286,8 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	if (m == NULL)
 		return ENOMEM;
 	req = mtod(m, struct mt76_connac_hw_scan_req *);
+	/* The mbuf payload is not initialized by allocation. */
+	memset(req, 0, sizeof(*req));
 
 	sc->sc_flags |= MWX_FLAG_SCANNING;
 	sc->sc_scan_seq_num = (sc->sc_scan_seq_num + 1) & 0x7f;
