@@ -124,7 +124,14 @@ bool SimpleMtkWlan::configureInterface(IONetworkInterface *netif)
     ether_ifattach(ifp, OSDynamicCast(IOEthernetInterface, netif));
     fpNetStats->collisions = 0;
 #ifdef __PRIVATE_SPI__
-    netif->configureOutputPullModel(fHalService->getDriverInfo()->getTxQueueSize(), 0, 0, IOEthernetInterface::kOutputPacketSchedulingModelNormal, 0);
+    // TXWI freelist and DMA rings are also accessed by interrupt events on
+    // this work loop. The default pull thread is not serialized with them.
+    if (netif->configureOutputPullModel(
+            fHalService->getDriverInfo()->getTxQueueSize(),
+            kIONetworkWorkLoopSynchronous, 0,
+            IOEthernetInterface::kOutputPacketSchedulingModelNormal, 0)
+            != kIOReturnSuccess)
+        return false;
 #endif
     
     return true;
