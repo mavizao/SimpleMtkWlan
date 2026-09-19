@@ -1044,8 +1044,11 @@ mwx_start(struct ifnet *ifp)
 		if (ic->ic_rawbpf != NULL)
 			bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_OUT);
 #endif
-		if (mwx_tx(sc, m, ni) != 0) {
-			ieee80211_release_node(ic, ni);
+		int rv = mwx_tx(sc, m, ni);
+		/* mwx_tx copies node metadata into the descriptor; completion uses
+		 * the packet/token only, so release the enqueue reference here. */
+		ieee80211_release_node(ic, ni);
+		if (rv != 0) {
 			ifp->if_oerrors++;
 			continue;
 		}
@@ -1492,16 +1495,22 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	struct mt76_txwi *txp;
 	int rv;
 
-	if ((mt = mwx_txwi_get(sc)) == NULL)
+	if ((mt = mwx_txwi_get(sc)) == NULL) {
+		m_freem(m);
 		return ENOBUFS;
+	}
 	/* XXX DMA memory access without BUS_DMASYNC_PREWRITE */
 	txp = mt->mt_desc;
 	memset(txp, 0, sizeof(*txp));
 	mt7921_mac_write_txwi(sc, m, ni, txp);
 
 	rv = mwx_txwi_enqueue(sc, mt, m);
-	if (rv != 0)
+	if (rv != 0) {
+		/* Mapping failed before ownership reached the TXWI. */
+		m_freem(m);
+		mwx_txwi_put(sc, mt);
 		return rv;
+	}
 
 	static uint32_t tx_log_count;
 	if (tx_log_count < 32) {
@@ -1519,7 +1528,10 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 		tx_log_count++;
 	}
 
-	return mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
+	rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
+	if (rv != 0)
+		mwx_txwi_put(sc, mt);
+	return rv;
 }
 
 void
@@ -5811,6 +5823,10 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 
 	mwx_dma_tx_cleanup(sc, &sc->sc_txq);
 
+	/* Both the event header and each PAIR/MSDU word must be present. */
+	if (mbuf_pkthdr_len(m) < 2 * sizeof(txval))
+		goto out;
+
 	if ((m = m_pullup(m, mbuf_pkthdr_len(m))) == NULL)
 		return;
 
@@ -5827,6 +5843,9 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 	for (i = 0; i < count; i++) {
 		uint16_t msdu;
 
+		/* PAIR words extend count, but never the received payload. */
+		if ((size_t)i >= mbuf_len(m) / sizeof(*txfree))
+			break;
 		txval = le32toh(txfree[i]);
 		if (txval & MT_TX_FREE_PAIR) {
 			count++;
